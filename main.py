@@ -12,11 +12,11 @@ import tkinter as tk
 from tkinter import ttk,filedialog,messagebox
 from PIL import ImageTk
 from native import windows,desktops,window_info,user32,set_dpi,set_app_id,Hotkeys
-from media import STATE,Asset,save_asset,preview,validate_video
+from media import STATE,Asset,save_asset,preview,validate_video,TaskCancelled,check_cancelled
 from scanner import scan,discover_roots,unique_roots,scan_summary
 from browser import Edge
 
-TITLE='窗口媒体抓取器 1.5'
+TITLE='窗口媒体抓取器 1.5.1'
 QUALITIES=['原始画质','高画质（1080p）','均衡（720p）','省空间（480p）']
 FORMATS=['保留原始格式','PNG','JPEG','WebP','GIF','MP4','WebM','MKV']
 HELP='''快速开始
@@ -44,6 +44,8 @@ Edge 网页：输入网页地址，点击“打开抓取用 Edge”。回到本�
 HLS/DASH 清单尝试合并网站提供的无保护视频流，不转码且无声。部分网站需要专门适配；只得到片段或受保护资源时，程序会报告失败，不会把不完整片段冒充完整视频。
 
 视频缓存按原始资源的范围和覆盖记录拼接，缺少分段时列为“待下载”，保存时尝试下载完整原始资源。预览前检查容器和首帧；保存前全程解码检查，转换后再次校验，发现损坏时不生成最终文件。长视频的校验需要时间，可点击“停止任务”取消。检查不能保证所有系统播放器都支持原始编码；点击“打开/播放原文件”使用 Edge 播放视频。需要兼容常见播放器时，输出格式请选择 MP4。
+
+停止保存/转换/校验：点击“停止任务”后清理当前未完成文件，不继续处理后续素材，日志显示“已停止”及成功、失败、未处理数量；主动取消不计作失败。已经保存成功的文件保留，任务停止后可以立即开始新任务。
 
 目录发现与诊断：自动搜索所选软件安装目录、对应用户数据目录中的常见媒体目录；初次扫描无结果时，会在有限深度内补充搜索。手动选择的目录会记住到该软件，下次扫描继续使用。扫描结果会说明路径失效、不可读、超出大小限制、损坏文件或不支持的资源包。扫描无结果不能判断加密；该功能不会解密资源包。自动搜索有范围和数量限制，特殊软件仍可能需要手动指定目录。
 
@@ -150,11 +152,16 @@ class App:
         def run():
             try:
                 result=func()
-                if done:self.send('callback',(done,result))
+                if done and not self.job_stop.is_set():self.send('callback',(done,result))
+            except TaskCancelled:self.send('log','任务已停止。')
             except Exception as e:self.send('error',str(e))
             finally:self.send('job_done')
         self.job_thread=threading.Thread(target=run,daemon=True);self.job_thread.start();return True
-    def stop_job(self):self.watch.set(False);self.job_stop.set();self.log('正在停止任务…')
+    def stop_job(self):
+        self.watch.set(False)
+        if self.watch_after:self.root.after_cancel(self.watch_after);self.watch_after=None
+        if not self.busy:self.log('当前没有正在执行的任务。');return
+        self.job_stop.set();self.log('正在停止任务并清理未完成文件…')
     def choose_scan(self):
         root=filedialog.askdirectory(title='选择媒体缓存或素材目录（只读扫描）')
         if root:
@@ -267,11 +274,13 @@ class App:
         a=items[0]
         def work():
             if a.category=='视频':
-                validate_video(a)
+                validate_video(a,stop=self.job_stop)
+                check_cancelled(self.job_stop)
                 for base in ('PROGRAMFILES(X86)','PROGRAMFILES','LOCALAPPDATA'):
                     edge=Path(os.environ.get(base,''))/'Microsoft/Edge/Application/msedge.exe'
                     if edge.is_file():
                         subprocess.Popen([str(edge),a.path.resolve().as_uri()]);return
+            check_cancelled(self.job_stop)
             try:os.startfile(a.path)
             except OSError:raise RuntimeError('系统没有对应的打开程序；可先保存并使用播放器查看。')
         self.job(work)
@@ -290,12 +299,15 @@ class App:
                         if a.category=='视频':self.send('log','正在全程校验并保存视频…')
                         save_asset(a,folder,fmt,quality,self.job_stop);self.send('asset',a)
                     saved+=1
+                except TaskCancelled:break
                 except Exception as e:
+                    if self.job_stop.is_set():break
                     failed+=1
                     # Never put network credentials/query strings in error logs.
                     text=str(e) if isinstance(e,RuntimeError) else f'{type(e).__name__}：资源不可读、网络请求失败或输出目录无法写入。'
                     self.send('log','处理失败：'+text)
-            self.send('log',f'{"下载到暂存" if download_only else "保存"}完成：成功 {saved}，失败 {failed}。'+(' 保存位置：'+folder if not download_only and saved else ''))
+            state='已停止' if self.job_stop.is_set() else '完成'
+            self.send('log',f'{"下载到暂存" if download_only else "保存"}{state}：成功 {saved}，失败 {failed}，未处理 {len(items)-saved-failed}。'+(' 保存位置：'+folder if not download_only and saved else ''))
         self.job(work)
     def clean_staging(self):
         if self.busy or (self.record_thread and self.record_thread.is_alive()):self.log('请先停止任务，再清理暂存。');return
@@ -393,6 +405,21 @@ def main():
                         video=record(own,STATE/'smoke','MP4','均衡（720p）',12,stop,lambda _:None);timer.cancel()
                         run_ffmpeg(['-i',str(video),'-f','null','-'])
                         status='UI_READY\nPACKAGED_CAPTURE_OK\n'+str(picture)+'\n'+str(video)
+                        if '--verify-cancellation' in sys.argv:
+                            from PIL import Image
+                            from media import convert_image
+                            image_result=save_asset(Asset(picture,'png','fixture',name='worker'),STATE/'smoke','JPEG','原始画质',threading.Event())
+                            with Image.open(image_result) as im:im.verify()
+                            large=STATE/'smoke/cancel-image.bmp';cancelled_output=STATE/'smoke/cancelled.working.webp'
+                            Image.new('RGB',(6000,6000),'#1479f8').save(large)
+                            cancel=threading.Event();timer=threading.Timer(.3,cancel.set);timer.start()
+                            try:
+                                try:convert_image(large,cancelled_output,'webp','原始画质',cancel)
+                                except TaskCancelled:pass
+                                else:raise RuntimeError('打包版图片转换未响应停止')
+                                status+='\nPACKAGED_IMAGE_WORKER_OK\nPACKAGED_CANCELLATION_OK'
+                            finally:
+                                timer.cancel();large.unlink(missing_ok=True);cancelled_output.unlink(missing_ok=True)
                         if '--verify-desktop' in sys.argv:
                             target=desktops()[0]
                             picture=screenshot(target,STATE/'smoke','PNG','省空间（480p）')
@@ -411,6 +438,8 @@ def main():
     root.mainloop()
 
 if __name__=='__main__':
+    import multiprocessing
+    multiprocessing.freeze_support()
     try:main()
     except Exception:
         STATE.mkdir(parents=True,exist_ok=True);(STATE/'startup-error.txt').write_text(traceback.format_exc(),'utf-8')

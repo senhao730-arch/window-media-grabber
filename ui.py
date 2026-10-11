@@ -69,7 +69,7 @@ def build_ui(app,title,formats,qualities,help_text):
     tools=card(header,padding=(12,8));tools.pack(side='right')
     ttk.Checkbutton(tools,text='启用快捷键',variable=app.hotkey_enabled,command=app.toggle_hotkeys).pack(side='right')
     app.hot_status=label(tools,'',style_name='Muted.TLabel');app.hot_status.pack(side='right',padx=(0,10))
-    ttk.Label(header,text='v1.5',foreground=MUTED).pack(side='right',padx=18)
+    ttk.Label(header,text='v'+title.rsplit(' ',1)[-1],foreground=MUTED).pack(side='right',padx=18)
 
     settings=card(outer);settings.grid(row=1,column=0,sticky='ew',pady=(0,16));settings.columnconfigure(1,weight=1)
     label(settings,'抓取目标',style_name='Muted.TLabel').grid(row=0,column=0,sticky='w',padx=(0,12))

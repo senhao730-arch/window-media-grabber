@@ -2,7 +2,6 @@ import hashlib
 import io
 import os
 import re
-import shutil
 import subprocess
 import threading
 import time
@@ -17,6 +16,58 @@ CREATE_NO_WINDOW=0x08000000
 STATE=Path(os.environ.get('LOCALAPPDATA',str(Path.cwd()))) / 'WindowMediaGrabber'
 STAGING=STATE/'staging'
 FFMPEG=imageio_ffmpeg.get_ffmpeg_exe()
+
+class TaskCancelled(RuntimeError):
+    """An explicit user cancellation, not a media-processing failure."""
+
+def check_cancelled(stop):
+    if stop is not None and stop.is_set():raise TaskCancelled('任务已取消')
+
+def stop_process(process):
+    if process.poll() is None:
+        process.terminate()
+        try:process.communicate(timeout=1)
+        except subprocess.TimeoutExpired:
+            process.kill();process.communicate(timeout=3)
+
+def copy_cancelable(source,destination,stop):
+    with Path(source).open('rb') as src,Path(destination).open('wb') as dst:
+        while True:
+            check_cancelled(stop)
+            chunk=src.read(1024*1024)
+            if not chunk:break
+            check_cancelled(stop)
+            dst.write(chunk)
+    check_cancelled(stop)
+
+def convert_image(source,destination,ext,quality,stop):
+    from image_worker import convert,worker
+    check_cancelled(stop)
+    if stop is None:
+        convert(source,destination,ext,quality);return
+    # Pillow codec calls cannot be interrupted inside a thread. Isolate them so
+    # cancelling a large image can release its file handles before cleanup.
+    import multiprocessing
+    context=multiprocessing.get_context('spawn')
+    receiver,sender=context.Pipe(duplex=False)
+    process=context.Process(target=worker,args=(str(source),str(destination),ext,quality,sender),daemon=True)
+    try:
+        process.start();sender.close()
+        while True:
+            check_cancelled(stop)
+            if receiver.poll(.05):
+                try:result=receiver.recv()
+                except EOFError:raise RuntimeError('图片转换进程意外结束。')
+                check_cancelled(stop)
+                if result is not None:raise RuntimeError(result)
+                return
+            if not process.is_alive():raise RuntimeError('图片转换进程意外结束。')
+    finally:
+        if process.pid:
+            if process.is_alive():process.terminate()
+            process.join(1)
+            if process.is_alive():process.kill();process.join(3)
+        receiver.close();sender.close()
 
 def sniff(data):
     if data.startswith(b'\x89PNG\r\n\x1a\n'):return 'png'
@@ -105,7 +156,8 @@ def expected_webm_length(head):
     size,n,unknown=ebml_vint(head,pos+4)
     return None if unknown else pos+4+n+size
 
-def check_video_container(path,ext):
+def check_video_container(path,ext,stop=None):
+    check_cancelled(stop)
     size=path.stat().st_size
     with path.open('rb') as f:
         head=f.read(4096)
@@ -116,6 +168,7 @@ def check_video_container(path,ext):
         elif ext in ('mp4','mov'):
             offset=0;has_moov=False
             while offset<size:
+                check_cancelled(stop)
                 f.seek(offset);box=f.read(16)
                 if len(box)<8:raise RuntimeError('MP4 尾部被截断。')
                 length=int.from_bytes(box[:4],'big');header=8
@@ -129,24 +182,24 @@ def check_video_container(path,ext):
             if not has_moov:raise RuntimeError('只有 MP4 视频片段，缺少完整视频索引。')
 
 def validate_video(asset,full=False,stop=None):
+    check_cancelled(stop)
     stamp=(asset.path.stat().st_size,asset.path.stat().st_mtime_ns)
     if (asset.video_full_checked and asset.full_validation_stamp==stamp) or (not full and asset.video_checked and asset.validation_stamp==stamp):return
-    check_video_container(asset.path,asset.ext)
+    check_video_container(asset.path,asset.ext,stop)
+    check_cancelled(stop)
     args=[FFMPEG,'-hide_banner','-loglevel','info','-xerror','-err_detect','explode','-i',str(asset.path),'-map','0:v:0']
     if not full:args+=['-frames:v','1']
     p=subprocess.Popen(args+['-f','null','-'],stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,creationflags=CREATE_NO_WINDOW)
     started=time.monotonic()
     try:
         while True:
-            if stop and stop.is_set():raise RuntimeError('已取消视频校验')
+            check_cancelled(stop)
             if not full and time.monotonic()-started>20:raise RuntimeError('视频解码验证超时，请检查文件是否完整。')
             try:_,err=p.communicate(timeout=.25);break
             except subprocess.TimeoutExpired:pass
     finally:
-        if p.poll() is None:
-            p.terminate()
-            try:p.communicate(timeout=3)
-            except subprocess.TimeoutExpired:p.kill();p.communicate()
+        stop_process(p)
+    check_cancelled(stop)
     text=err.decode('utf-8','replace')
     if p.returncode or any(t in text.lower() for t in ('file ended prematurely','invalid data found','error while decoding','packet corrupt','output file is empty','nothing was written')):
         raise RuntimeError('视频没有通过解码检查，可能是损坏文件或不完整缓存。')
@@ -165,18 +218,18 @@ def stage_bytes(data,ext):
     return path,digest
 
 def run_ffmpeg(args,stop=None):
+    check_cancelled(stop)
     # Credentials, if supplied, remain in memory; logs are never displayed verbatim.
     p=subprocess.Popen([FFMPEG,'-hide_banner','-loglevel','error','-y']+args,
         stdout=subprocess.DEVNULL,stderr=subprocess.PIPE,creationflags=CREATE_NO_WINDOW)
-    while True:
-        try:
-            _,err=p.communicate(timeout=.25);break
-        except subprocess.TimeoutExpired:
-            if stop and stop.is_set():
-                p.terminate()
-                try:p.communicate(timeout=3)
-                except subprocess.TimeoutExpired:p.kill();p.communicate()
-                raise RuntimeError('已取消')
+    try:
+        while True:
+            check_cancelled(stop)
+            try:
+                _,err=p.communicate(timeout=.1);break
+            except subprocess.TimeoutExpired:pass
+        check_cancelled(stop)
+    finally:stop_process(p)
     if p.returncode:raise RuntimeError('媒体转换失败：格式不受支持、文件不完整或网络资源不可访问。请尝试保留原始格式。')
 
 def scale_filter(quality):
@@ -194,6 +247,7 @@ def output_path(folder,asset,ext):
     return path
 
 def save_asset(asset,folder,fmt='保留原始格式',quality='原始画质',stop=None):
+    check_cancelled(stop)
     if not asset.path:raise RuntimeError('当前只有媒体地址，请先下载原始资源。')
     if asset.ext in ('m3u8','mpd'):raise RuntimeError('这是播放清单。请在 Edge 抓取页下载或合并视频。')
     if asset.category=='视频':validate_video(asset,full=True,stop=stop)
@@ -204,16 +258,10 @@ def save_asset(asset,folder,fmt='保留原始格式',quality='原始画质',stop
     temp=dest.with_name(dest.stem+'.working.'+ext)
     try:
         # 原文件直接复制才能保持字节、动画和画质。转换不冒充无损原始文件。
-        if fmt=='保留原始格式' and quality=='原始画质':shutil.copyfile(asset.path,temp)
+        if fmt=='保留原始格式' and quality=='原始画质':copy_cancelable(asset.path,temp,stop)
         elif asset.category=='图片':
             if ext in ('mp4','webm','mkv','mov','gif'):raise RuntimeError('静态图片请使用 PNG、JPEG 或 WebP。')
-            with Image.open(asset.path) as im:
-                im=ImageOps.exif_transpose(im)
-                limit={'高画质（1080p）':1080,'均衡（720p）':720,'省空间（480p）':480}.get(quality)
-                if limit and im.height>limit:im=im.resize((max(1,round(im.width*limit/im.height)),limit),Image.Resampling.LANCZOS)
-                if ext=='jpg':im=im.convert('RGB')
-                opts={'quality':95 if quality in ('原始画质','高画质（1080p）') else 85}
-                im.save(temp,**(opts if ext in ('jpg','webp') else {}))
+            convert_image(asset.path,temp,ext,quality,stop)
         else:
             if ext not in ('gif','webp','mp4','webm','mkv','mov'):raise RuntimeError('动图或视频请选择 GIF、WebP、MP4、WebM 或 MKV；不会静默丢失动画。')
             vf=scale_filter(quality)
@@ -225,7 +273,7 @@ def save_asset(asset,folder,fmt='保留原始格式',quality='原始画质',stop
                     timeline=[];last=''
                     with Image.open(asset.path) as im:
                         for i in range(im.n_frames):
-                            if stop and stop.is_set():raise RuntimeError('已取消')
+                            check_cancelled(stop)
                             im.seek(i);last=f'frame_{i:06d}.png';im.convert('RGBA').save(Path(animation_dir)/last)
                             timeline += [f"file '{last}'",f"duration {max(10,im.info.get('duration',100))/1000:.4f}"]
                     timeline.append(f"file '{last}'")
@@ -238,9 +286,11 @@ def save_asset(asset,folder,fmt='保留原始格式',quality='原始画质',stop
                     args+=['-vf',vf,'-c:v','libx264','-preset','fast','-crf','18' if quality=='原始画质' else '23','-pix_fmt','yuv420p']
                     if ext=='mp4':args+=['-movflags','+faststart']
                 run_ffmpeg(args+[str(temp)],stop)
+        check_cancelled(stop)
         if not temp.exists() or not temp.stat().st_size:raise RuntimeError('输出文件为空')
         if ext in ('mp4','webm','mkv','mov'):
             validate_video(Asset(temp,ext,'输出校验'),full=True,stop=stop)
+        check_cancelled(stop)
         os.replace(temp,dest)
         return dest
     finally:
