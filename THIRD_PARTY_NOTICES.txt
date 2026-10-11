@@ -1,0 +1,15 @@
+Third-party components retain their respective licenses.
+The application source is MIT licensed. FFmpeg runs as a separate executable.
+
+FFmpeg 7.1 essentials (GPL v3 build, gyan.dev):
+https://ffmpeg.org/
+https://ffmpeg.org/releases/ffmpeg-7.1.tar.xz
+https://www.gyan.dev/ffmpeg/builds/
+https://github.com/imageio/imageio-ffmpeg
+
+Windows Capture 2.0.1 (MIT):
+https://github.com/NiiightmareXD/windows-capture
+
+Pillow, requests, websocket-client, psutil, numpy, OpenCV, imageio-ffmpeg,
+PyInstaller, Python and Tcl/Tk are used by this executable.
+Included notices below are copied from the installed build dependencies.
