@@ -7,3 +7,5 @@ windows-capture==2.0.1
 numpy==2.5.4
 opencv-python==5.0.0.93
 pyinstaller==6.22.3
+pystray==0.19.5
+six==1.17.0

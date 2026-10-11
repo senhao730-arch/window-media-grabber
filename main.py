@@ -16,10 +16,12 @@ from media import STATE,Asset,save_asset,preview,validate_video,TaskCancelled,ch
 from scanner import scan,discover_roots,unique_roots,scan_summary
 from browser import Edge
 
-TITLE='窗口媒体抓取器 1.5.1'
+TITLE='窗口媒体抓取器 1.5.2'
 QUALITIES=['原始画质','高画质（1080p）','均衡（720p）','省空间（480p）']
 FORMATS=['保留原始格式','PNG','JPEG','WebP','GIF','MP4','WebM','MKV']
 HELP='''快速开始
+
+关闭窗口：点击右上角 × 收起到系统托盘，保存、转换、校验和录制继续运行。双击托盘图标或右键选择“显示窗口”恢复界面。托盘菜单可打开保存目录、停止任务或录制、随时开关快捷键。选择“退出程序（等待保存完成）”会停止录制并保存，等待当前保存任务结束后退出；退出过程中不再接收新任务。需要取消保存时，先选择“停止保存任务”。后台运行需要电脑保持开机；睡眠、关机或强制结束进程无法继续保存。
 
 桌面抓取：顶部“抓取目标”可选择“整个桌面（全部屏幕）”或某一块屏幕。切换到“桌面 / 窗口”，点击截图或录制按钮，支持画质、格式和帧率设置，默认保存到 D:\\抓取内容。选择桌面后，Ctrl+Alt+F7/F8/F9会一直操作该桌面，即使其他软件在前台；Ctrl+Alt+F6仍用于选中活动软件并扫描缓存。快捷键可随时关闭。
 
@@ -70,6 +72,7 @@ class App:
         self.root=root;root.title(TITLE);root.geometry(f'1360x{min(960,root.winfo_screenheight()-100)}');root.minsize(1120,760)
         self.events=queue.Queue();self.items={};self.url_keys={};self.rows={};self.window_list=[];self.targets_list=[]
         self.busy=False;self.closing=False;self.job_stop=threading.Event();self.record_stop=threading.Event();self.record_thread=None
+        self.tray=None;self.tray_pending=False;self.background=False;self.destroyed=False
         self.hotkeys=None;self.hotkey_thread=None;self.watch_after=None;self.preview_serial=0;self.animation_after=None
         STATE.mkdir(parents=True,exist_ok=True)
         try:self.config=json.loads((STATE/'settings.json').read_text('utf-8'))
@@ -135,6 +138,7 @@ class App:
             self.hotkeys=Hotkeys(self.send);self.hotkey_thread=threading.Thread(target=self.hotkeys.run,daemon=True);self.hotkey_thread.start()
             self.hot_status.configure(text='快捷键已启用',foreground='#1769ce')
         else:self.hot_status.configure(text='快捷键已关闭',foreground='#68758b')
+        if self.tray:self.tray.update(self.hotkey_enabled.get())
         self.persist()
     def persist(self):
         values={'folder':self.folder.get(),'format':self.format.get(),'quality':self.quality.get(),'hotkeys':self.hotkey_enabled.get(),'scan_roots':self.scan_roots}
@@ -147,6 +151,7 @@ class App:
         try:p=Path(self.folder.get());p.mkdir(parents=True,exist_ok=True);os.startfile(p)
         except Exception as e:messagebox.showerror(TITLE,str(e))
     def job(self,func,done=None):
+        if self.closing:return False
         if self.busy:self.log('已有任务正在执行，请等待或点击“停止任务”。');return False
         self.busy=True;self.job_stop=threading.Event()
         def run():
@@ -329,6 +334,7 @@ class App:
             path=screenshot(w,folder,fmt,quality);self.send('log','截图已保存：'+str(path))
         self.job(work)
     def toggle_record(self,fmt):
+        if self.closing:return
         if self.record_thread and self.record_thread.is_alive():self.record_stop.set();self.record_status.set('正在结束并保存…');return
         try:w=self.selected_window();fps=12 if fmt=='GIF' else self.fps.get()
         except Exception as e:self.log(str(e));return
@@ -345,6 +351,7 @@ class App:
 
     def drain(self):
         for _ in range(150):
+            if self.destroyed:return
             try:event,value=self.events.get_nowait()
             except queue.Empty:break
             if event=='asset':self.add_asset(value)
@@ -352,9 +359,17 @@ class App:
             elif event=='error':self.log('失败：'+value)
             elif event=='callback':
                 callback,result=value;callback(result)
+            elif event=='tray_action':
+                if value=='show':self.show_window()
+                elif value=='folder':self.open_output()
+                elif value=='stop':self.stop_job()
+                elif value=='record_stop':self.record_stop.set()
+                elif value=='hotkeys' and not self.closing:
+                    self.hotkey_enabled.set(not self.hotkey_enabled.get());self.toggle_hotkeys()
+                elif value=='exit':self.request_exit()
             elif event=='job_done':
                 self.busy=False
-                if self.watch.get():
+                if self.watch.get() and not self.closing:
                     if self.watch_after:self.root.after_cancel(self.watch_after)
                     self.watch_after=self.root.after(5000,lambda:self.start_scan() if self.watch.get() else None)
             elif event=='record_done':self.record_status.set('未录制 · 文件状态见下方日志')
@@ -364,7 +379,7 @@ class App:
                     if im is None:self.image_label.configure(image='',text='暂时无法预览\n可用系统应用打开原文件')
                     else:
                         self.preview_original=im;self.update_preview_image()
-            elif event=='hotkey' and self.hotkey_enabled.get():
+            elif event=='hotkey' and self.hotkey_enabled.get() and not self.closing:
                 number,w=value
                 index=self.wincombo.current()
                 desktop_selected=0<=index<len(self.window_list) and self.window_list[index].desktop
@@ -373,23 +388,52 @@ class App:
                 elif number==2:self.take_shot()
                 elif number==3:self.toggle_record('GIF')
                 elif number==4:self.toggle_record(self.video_format.get())
-        if not self.closing:self.root.after(80,self.drain)
+        if not self.destroyed:self.root.after(80,self.drain)
     def close(self):
+        if self.closing or self.tray_pending:return
+        if self.tray and self.tray.ready.is_set():self.hide_window();return
+        try:
+            from tray import Tray
+            self.tray=Tray(self.send,TITLE,self.hotkey_enabled.get());self.tray.start()
+        except Exception as exc:
+            self.tray=None;self.log('无法收起到托盘，窗口保持打开：'+str(exc));return
+        self.tray_pending=True;deadline=time.monotonic()+5
+        def ready():
+            if self.closing:self.tray_pending=False;return
+            if self.tray.ready.is_set():self.tray_pending=False;self.hide_window()
+            elif self.tray.failed or time.monotonic()>deadline:
+                self.tray_pending=False;error=self.tray.failed or '启动超时'
+                self.tray.stop();self.tray=None;self.log('无法收起到托盘，窗口保持打开：'+error)
+            else:self.root.after(50,ready)
+        ready()
+    def hide_window(self):
+        self.persist();self.log('已收起到系统托盘，任务继续在后台运行。');self.background=True;self.root.withdraw()
+    def show_window(self):
+        self.background=False;self.root.deiconify();self.root.lift();self.root.focus_force()
+    def request_exit(self):
         if self.closing:return
-        self.closing=True;self.watch.set(False);self.job_stop.set();self.record_stop.set();self.persist()
+        self.closing=True;self.watch.set(False);self.record_stop.set();self.persist()
+        if self.watch_after:self.root.after_cancel(self.watch_after);self.watch_after=None
         if self.hotkeys:self.hotkeys.close()
-        self.edge.close()
-        self.status.set('正在结束任务并保存录制…')
-        deadline=time.monotonic()+35
+        self.log('正在退出：等待保存任务完成，并结束录制保存文件…')
         def finish():
             active=(self.record_thread and self.record_thread.is_alive()) or (hasattr(self,'job_thread') and self.job_thread.is_alive())
-            if active and time.monotonic()<deadline:self.root.after(100,finish)
-            else:self.root.destroy()
+            if active:self.root.after(100,finish)
+            else:
+                self.edge.close()
+                if self.tray:self.tray.stop();self.tray=None
+                for timer in self.root.tk.call('after','info'):self.root.after_cancel(timer)
+                self.destroyed=True
+                self.root.destroy()
         finish()
 
 def main():
     set_dpi();set_app_id()
     root=tk.Tk();app=App(root)
+    if '--verify-tray' in sys.argv:
+        from background_check import verify_background
+        root.after(800,lambda:verify_background(app))
+        root.mainloop();return
     if '--smoke-ui' in sys.argv:
         # Own-application launch check; not part of the normal user workflow.
         def done():
@@ -430,10 +474,10 @@ def main():
                         (STATE/'ui-smoke.txt').write_text(status,'utf-8')
                     except Exception:
                         (STATE/'ui-smoke.txt').write_text('FAILED\n'+traceback.format_exc(),'utf-8')
-                    finally:app.send('callback',(lambda _:app.close(),None))
+                    finally:app.send('callback',(lambda _:app.request_exit(),None))
                 threading.Thread(target=verify,daemon=True).start()
             else:
-                (STATE/'ui-smoke.txt').write_text('UI_READY\n'+str(len(app.window_list))+' windows\n','utf-8');app.close()
+                (STATE/'ui-smoke.txt').write_text('UI_READY\n'+str(len(app.window_list))+' windows\n','utf-8');app.request_exit()
         root.after(1800,done)
     root.mainloop()
 

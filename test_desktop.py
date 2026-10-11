@@ -68,6 +68,6 @@ class DesktopTests(unittest.TestCase):
                     app.start_scan();self.assertFalse(app.busy)
                 finally:
                     for timer in root.tk.call('after','info'):root.after_cancel(timer)
-                    app.close()
+                    app.request_exit()
 
 if __name__=='__main__':unittest.main(verbosity=2)

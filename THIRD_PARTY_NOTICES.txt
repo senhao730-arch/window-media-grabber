@@ -11,5 +11,6 @@ Windows Capture 2.0.1 (MIT):
 https://github.com/NiiightmareXD/windows-capture
 
 Pillow, requests, websocket-client, psutil, numpy, OpenCV, imageio-ffmpeg,
-PyInstaller, Python and Tcl/Tk are used by this executable.
+PyInstaller, pystray (LGPL v3), six, Python and Tcl/Tk are used by this executable.
+pystray source: https://github.com/moses-palmer/pystray/tree/v0.19.5
 Included notices below are copied from the installed build dependencies.

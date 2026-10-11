@@ -67,6 +67,7 @@ def build_ui(app,title,formats,qualities,help_text):
     ttk.Label(identity,text='窗口媒体抓取器',font=('Microsoft YaHei UI',21,'bold')).pack(anchor='w')
     ttk.Label(identity,text='原始素材提取  /  桌面与窗口记录',foreground=MUTED).pack(anchor='w',pady=(3,0))
     tools=card(header,padding=(12,8));tools.pack(side='right')
+    ttk.Button(tools,text='退出',command=app.request_exit,style='Small.TButton').pack(side='right',padx=(10,0))
     ttk.Checkbutton(tools,text='启用快捷键',variable=app.hotkey_enabled,command=app.toggle_hotkeys).pack(side='right')
     app.hot_status=label(tools,'',style_name='Muted.TLabel');app.hot_status.pack(side='right',padx=(0,10))
     ttk.Label(header,text='v'+title.rsplit(' ',1)[-1],foreground=MUTED).pack(side='right',padx=18)
@@ -101,6 +102,7 @@ def build_ui(app,title,formats,qualities,help_text):
         for i,button in enumerate(navbuttons):button.configure(style='Selected.Nav.TButton' if i==selected else 'Nav.TButton')
     app.notebook.bind('<<NotebookTabChanged>>',select_nav);select_nav()
     ttk.Label(nav,text='默认保存到\nD:\\抓取内容',foreground=MUTED,justify='left').pack(side='bottom',anchor='w',padx=15,pady=12)
+    ttk.Label(nav,text='关闭窗口后\n任务在托盘继续',foreground=MUTED,justify='left').pack(side='bottom',anchor='w',padx=15,pady=8)
 
     assets,recording,help_page=pages
     assets.columnconfigure(0,weight=1);assets.rowconfigure(2,weight=1)

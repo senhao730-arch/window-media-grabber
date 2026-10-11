@@ -72,6 +72,6 @@ class DiscoveryTests(unittest.TestCase):
                         self.assertFalse(app.busy);self.assertEqual(len(app.items),1)
                     finally:
                         for timer in root.tk.call('after','info'):root.after_cancel(timer)
-                        app.close()
+                        app.request_exit()
 
 if __name__=='__main__':unittest.main(verbosity=2)
